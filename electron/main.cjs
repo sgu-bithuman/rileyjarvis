@@ -5,6 +5,7 @@ const path = require("node:path");
 const fs = require("node:fs/promises");
 const crypto = require("node:crypto");
 const dotenv = require("dotenv");
+const { createBrowserAgent } = require("./browser.cjs");
 
 dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 
@@ -26,8 +27,10 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 - Display mode is the default. Use the app and artifact panel to show things. Do not control the computer.
 - Computer use mode allows desktop control tools. Only use computer tools after the user asks for computer use or asks you to do something on their screen.
 
-# Controlling the computer
-- For any real task on the screen ("open Safari and search X", "reply to that email", "find me a flight", "rename this file"), call computer_task with a plain-language goal. It enters computer mode, then observes the screen and acts step by step on its own. This is the main way you get things done — prefer it over stringing together single actions.
+# Doing things for the user
+- For anything on the WEB — searching, looking something up, browsing, filling forms, shopping, booking, reading a page — use browser_task. It drives a real browser by the page's actual structure, so it is precise and does not misclick. This is the preferred way to get most things done; the user has a dedicated browser for this.
+- Use browser_open + browser_read for a quick "what does this page say" without a full task.
+- Only use computer_task for NATIVE macOS apps (Finder, Notes, Mail, System Settings, Music) — things that aren't in a browser. It observes the screen and acts step by step; accessibility support varies by app, so prefer the web path whenever the task can be done online.
 - For a quick one-off, use the primitives directly: computer_see (look at the screen), computer_inspect (list clickable elements), then computer_click (by index or label — never guess raw pixels if an element exists), computer_type, computer_key, computer_scroll.
 - To answer "what's on my screen" or "what does this say", use computer_see.
 - clipboard_read / clipboard_write are handy for moving text between apps without retyping.
@@ -273,6 +276,39 @@ const toolSpecs = [
       required: ["id", "confirmed"],
       additionalProperties: false,
     },
+  },
+  {
+    type: "function",
+    name: "browser_task",
+    description:
+      "Autonomously do a task on the WEB in a real browser (search, look something up, browse a site, fill a form, shop, book, read a page). This is the PRECISE path for anything online — it acts on the page's actual elements, not screen pixels, so it doesn't misclick. Prefer this over computer_task for anything web-related. If it returns requiresConfirmation, ask the user, then call again with the same goal and confirmTarget set to the pendingTarget string.",
+    parameters: {
+      type: "object",
+      properties: {
+        goal: { type: "string", description: "The web task to accomplish, in plain language." },
+        maxSteps: { type: "number", minimum: 1, maximum: 30 },
+        confirmTarget: { type: "string", description: "Only after the user approves a destructive step: the exact pendingTarget string from the prior result." },
+      },
+      required: ["goal"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "browser_open",
+    description: "Open a URL in Ricky's browser (and return its title). Use before browser_read, or when the user names a site.",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" } },
+      required: ["url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "browser_read",
+    description: "Return the readable text of the current browser page. Use to answer questions about what's on the page.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     type: "function",
@@ -748,6 +784,25 @@ function confirmMatches(destructiveLabel, confirmTarget) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// DOM browser agent — the precise path for web tasks (act on element refs, not pixels).
+// Runs in a dedicated isolated profile; headful by default so the user can watch/log in.
+let browserAgent = null;
+function getBrowserAgent() {
+  if (!browserAgent) {
+    browserAgent = createBrowserAgent({
+      profileDir: path.join(app.getPath("userData"), "browser-profile"),
+      headless: process.env.RICKY_BROWSER_HEADLESS === "1",
+      callVision,
+      pushArtifact,
+      pushTranscript,
+      isDestructive: (s) => DESTRUCTIVE.test(String(s || "")),
+      confirmMatches,
+      sleep,
+    });
+  }
+  return browserAgent;
+}
+
 const COMPUTER_PRIMITIVES = new Set([
   "computer_open_app",
   "computer_see",
@@ -857,6 +912,7 @@ async function runComputerTask(goal, { maxSteps = 12, confirmTarget = "" } = {})
     !perms.screenRecording && "Screen Recording",
   ].filter(Boolean);
   if (missing.length) {
+    bridge("permprompt").catch(() => {}); // surface the macOS grant dialogs
     const list = missing.join(" and ");
     return {
       ok: false,
@@ -1000,6 +1056,15 @@ async function createWindow() {
   } else {
     await win.loadFile(path.join(process.cwd(), "dist", "index.html"));
   }
+
+  // Surface the macOS Accessibility + Screen Recording dialogs on first launch so
+  // computer use works without the user hunting through System Settings. Best-effort:
+  // silently ignored if the native bridge isn't built yet.
+  bridgePermissions()
+    .then((perms) => {
+      if (!perms.accessibility || !perms.screenRecording) return bridge("permprompt");
+    })
+    .catch(() => {});
 }
 
 function setWindowMode(mode) {
@@ -1261,6 +1326,21 @@ ipcMain.handle("tools:execute", async (_event, toolCall) => {
     if (name === "clipboard_write") {
       await setClipboard(String(args.text || ""));
       return { ok: true, message: "Copied to the clipboard." };
+    }
+
+    if (name === "browser_task") {
+      return await getBrowserAgent().runBrowserTask(String(args.goal || ""), {
+        maxSteps: Math.max(1, Math.min(30, Number(args.maxSteps || 14))),
+        confirmTarget: String(args.confirmTarget || ""),
+      });
+    }
+
+    if (name === "browser_open") {
+      return await getBrowserAgent().openUrl(String(args.url || ""));
+    }
+
+    if (name === "browser_read") {
+      return await getBrowserAgent().readPage();
     }
 
     if (name === "computer_task") {

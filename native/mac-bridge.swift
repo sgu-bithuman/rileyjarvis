@@ -338,6 +338,12 @@ if NEEDS_AX.contains(cmd) && !AXIsProcessTrusted() {
 switch cmd {
 case "permcheck":
     cmdPermcheck()
+case "permprompt":
+    // Pop the macOS grant dialogs (Accessibility has no auto-prompt otherwise).
+    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+    let ax = AXIsProcessTrustedWithOptions(options)
+    let sr = CGRequestScreenCaptureAccess()
+    emit(["accessibility": ax, "screenRecording": sr])
 case "displayinfo":
     cmdDisplayInfo()
 case "frontapp":
