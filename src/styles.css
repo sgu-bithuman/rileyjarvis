@@ -100,6 +100,26 @@ button:disabled {
   background: rgba(86, 189, 255, 0.28);
 }
 
+.mini-status {
+  position: absolute;
+  z-index: 5;
+  left: 8px;
+  right: 8px;
+  bottom: 6px;
+  margin: 0;
+  padding: 4px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  line-height: 1.25;
+  text-align: center;
+  color: #d7f4ff;
+  background: rgba(4, 8, 14, 0.74);
+  backdrop-filter: blur(14px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .companion-window {
   position: relative;
   display: grid;

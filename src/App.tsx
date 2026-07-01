@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BrainCircuit, Expand, History, Keyboard, Mic, MicOff, MonitorCog, PanelRight, Send } from "lucide-react";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { RickyFace } from "./components/RickyFace";
@@ -22,9 +22,41 @@ export default function App() {
   ]);
   const [status, setStatus] = useState("Idle");
   const [textPrompt, setTextPrompt] = useState("");
+  const [taskStatus, setTaskStatus] = useState("");
   const clientRef = useRef<RickyRealtimeClient | null>(null);
 
   const isConnected = connectionState === "connected";
+
+  function applyMode(nextMode: RickyMode) {
+    setMode(nextMode);
+    if (nextMode === "computer") {
+      setArtifactVisible(false);
+      setArtifactFullscreen(false);
+      setShowLog(false);
+      setShowTypeInput(false);
+    } else {
+      setArtifactVisible(true);
+      setTaskStatus("");
+    }
+  }
+
+  // Live updates pushed from the main process while computer_task runs.
+  useEffect(() => {
+    const offArtifact = window.ricky.onPushArtifact((nextArtifact) => {
+      setArtifact(nextArtifact);
+      if (nextArtifact.fullscreen) setArtifactFullscreen(true);
+    });
+    const offTranscript = window.ricky.onPushTranscript((entry) => {
+      setTranscript((items) => [newEntry(entry.role, entry.text), ...items].slice(0, 80));
+      if (entry.role === "tool") setTaskStatus(entry.text);
+    });
+    const offMode = window.ricky.onSetMode((nextMode) => applyMode(nextMode));
+    return () => {
+      offArtifact();
+      offTranscript();
+      offMode();
+    };
+  }, []);
 
   async function connect() {
     const client = new RickyRealtimeClient({
@@ -37,17 +69,7 @@ export default function App() {
         setArtifactVisible(true);
         if (nextArtifact.fullscreen) setArtifactFullscreen(true);
       },
-      onMode: (nextMode) => {
-        setMode(nextMode);
-        if (nextMode === "computer") {
-          setArtifactVisible(false);
-          setArtifactFullscreen(false);
-          setShowLog(false);
-          setShowTypeInput(false);
-        } else {
-          setArtifactVisible(true);
-        }
-      },
+      onMode: applyMode,
       onStatus: (message) => {
         setStatus(message);
         setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
@@ -65,17 +87,9 @@ export default function App() {
   }
 
   async function switchMode(nextMode: RickyMode) {
-    setMode(nextMode);
+    applyMode(nextMode);
     const result = await window.ricky.executeTool({ name: "set_mode", arguments: { mode: nextMode } });
     if (result.artifact) setArtifact(result.artifact);
-    if (nextMode === "computer") {
-      setArtifactVisible(false);
-      setArtifactFullscreen(false);
-      setShowLog(false);
-      setShowTypeInput(false);
-    } else {
-      setArtifactVisible(true);
-    }
     setTranscript((items) => [newEntry("system", `Mode switched to ${nextMode}.`), ...items].slice(0, 80));
   }
 
@@ -92,6 +106,11 @@ export default function App() {
       <main className="app-shell app-shell-mini">
         <section className="mini-companion" aria-label="Ricky computer use mini mode">
           <RickyFace mood={mood} mouthShape={mouthShape} />
+          {taskStatus ? (
+            <p className="mini-status" title={taskStatus}>
+              {taskStatus}
+            </p>
+          ) : null}
           <button
             className="mini-restore-button"
             onClick={() => void switchMode("display")}

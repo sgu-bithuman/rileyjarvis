@@ -24,7 +24,14 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 
 # Modes
 - Display mode is the default. Use the app and artifact panel to show things. Do not control the computer.
-- Computer use mode allows desktop control tools. Only use computer tools after the user asks for computer use or asks you to control the computer.
+- Computer use mode allows desktop control tools. Only use computer tools after the user asks for computer use or asks you to do something on their screen.
+
+# Controlling the computer
+- For any real task on the screen ("open Safari and search X", "reply to that email", "find me a flight", "rename this file"), call computer_task with a plain-language goal. It enters computer mode, then observes the screen and acts step by step on its own. This is the main way you get things done — prefer it over stringing together single actions.
+- For a quick one-off, use the primitives directly: computer_see (look at the screen), computer_inspect (list clickable elements), then computer_click (by index or label — never guess raw pixels if an element exists), computer_type, computer_key, computer_scroll.
+- To answer "what's on my screen" or "what does this say", use computer_see.
+- clipboard_read / clipboard_write are handy for moving text between apps without retyping.
+- If computer_task returns requiresConfirmation, tell the user exactly what it wants to do, ask them out loud, and only if they approve call computer_task again with allowRisky true.
 
 # Tool Behavior
 - Use read-only tools when the user's intent is clear.
@@ -269,27 +276,81 @@ const toolSpecs = [
   },
   {
     type: "function",
+    name: "computer_task",
+    description:
+      "Autonomously accomplish a multi-step task on the user's screen (e.g. 'open Safari and search for X', 'reply to the top email', 'find the cheapest flight'). Ricky observes the screen, plans, and acts step by step, verifying visually. Use this for anything beyond a single click or keystroke. Enters computer use mode automatically. If it returns requiresConfirmation, ask the user out loud, then call again with allowRisky true.",
+    parameters: {
+      type: "object",
+      properties: {
+        goal: { type: "string", description: "The task to accomplish, in plain language." },
+        maxSteps: { type: "number", minimum: 1, maximum: 30 },
+        allowRisky: { type: "boolean", description: "Set true only after the user has explicitly confirmed a risky/destructive step." },
+      },
+      required: ["goal"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "computer_see",
+    description: "Look at the user's screen and describe it, or answer a specific question about what's visible. This is Ricky's eyes. Requires computer mode.",
+    parameters: {
+      type: "object",
+      properties: {
+        question: { type: "string", description: "Optional specific question about what is on screen." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "computer_inspect",
+    description: "List the clickable/interactive elements of the frontmost app via Accessibility, each with an index, role, label, and coordinates. Call this before computer_click to click by index or label instead of guessing pixels. Requires computer mode.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    type: "function",
     name: "computer_open_app",
     description: "Open a macOS app by name. Requires computer mode.",
     parameters: {
       type: "object",
-      properties: {
-        appName: { type: "string" },
-      },
+      properties: { appName: { type: "string" } },
       required: ["appName"],
       additionalProperties: false,
     },
   },
   {
     type: "function",
-    name: "computer_type_text",
-    description: "Type text into the active app. Requires computer mode. Do not ask for extra confirmation just to type.",
+    name: "computer_click",
+    description:
+      "Click a UI element. Prefer index (from computer_inspect) or a label; fall back to x/y or xNorm/yNorm (0-1 fraction of screen). Requires computer mode. Ricky auto-confirms destructive-looking targets, so ask the user before clicking send/delete/buy/submit.",
+    parameters: {
+      type: "object",
+      properties: {
+        index: { type: "number", description: "Element index from computer_inspect." },
+        label: { type: "string", description: "Visible label/text of the element to click." },
+        x: { type: "number" },
+        y: { type: "number" },
+        xNorm: { type: "number", minimum: 0, maximum: 1 },
+        yNorm: { type: "number", minimum: 0, maximum: 1 },
+        button: { type: "string", enum: ["left", "right"] },
+        double: { type: "boolean" },
+        confirmed: { type: "boolean" },
+        risk: { type: "string", enum: ["low", "may_send_or_modify", "private_or_sensitive"] },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "computer_type",
+    description: "Type text into the focused field. Requires computer mode. Set submit true to press Return after. paste true is more reliable for long or special text. No extra confirmation needed just to type.",
     parameters: {
       type: "object",
       properties: {
         text: { type: "string" },
-        confirmed: { type: "boolean" },
-        risk: { type: "string", enum: ["low", "may_send_or_modify", "private_or_sensitive"] },
+        submit: { type: "boolean" },
+        paste: { type: "boolean" },
       },
       required: ["text"],
       additionalProperties: false,
@@ -297,43 +358,27 @@ const toolSpecs = [
   },
   {
     type: "function",
-    name: "computer_press_key",
-    description: "Press a keyboard key in the active app. Requires computer mode. Use enter/return after typing when the user asks to send a prompt.",
+    name: "computer_key",
+    description: "Press a key or shortcut, including modifiers (e.g. 'return', 'escape', 'cmd+c', 'cmd+shift+t', 'arrowdown'). Requires computer mode.",
     parameters: {
       type: "object",
       properties: {
-        key: { type: "string", enum: ["enter", "return", "tab", "escape", "delete", "space", "up", "down", "left", "right"] },
+        combo: { type: "string", description: "e.g. 'cmd+t', 'return', 'escape', 'arrowdown'." },
         repeat: { type: "number", minimum: 1, maximum: 20 },
       },
-      required: ["key"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "computer_click",
-    description: "Click screen coordinates. Requires computer mode. Ask for confirmation before clicking buttons that send, delete, buy, submit, or change settings.",
-    parameters: {
-      type: "object",
-      properties: {
-        x: { type: "number" },
-        y: { type: "number" },
-        confirmed: { type: "boolean" },
-        risk: { type: "string", enum: ["low", "may_send_or_modify", "private_or_sensitive"] },
-      },
-      required: ["x", "y"],
+      required: ["combo"],
       additionalProperties: false,
     },
   },
   {
     type: "function",
     name: "computer_scroll",
-    description: "Scroll the active app. Requires computer mode.",
+    description: "Scroll the active app with the real scroll wheel. Requires computer mode.",
     parameters: {
       type: "object",
       properties: {
         direction: { type: "string", enum: ["up", "down", "left", "right"] },
-        amount: { type: "number", minimum: 1, maximum: 20 },
+        amount: { type: "number", minimum: 1, maximum: 50 },
       },
       required: ["direction"],
       additionalProperties: false,
@@ -341,21 +386,35 @@ const toolSpecs = [
   },
   {
     type: "function",
-    name: "screen_snapshot",
-    description: "Capture the current screen and return the local screenshot path. Requires computer mode.",
+    name: "computer_move",
+    description: "Move the cursor to an element (index/label) or coordinates without clicking. Requires computer mode.",
     parameters: {
       type: "object",
-      properties: {},
+      properties: {
+        index: { type: "number" },
+        label: { type: "string" },
+        x: { type: "number" },
+        y: { type: "number" },
+        xNorm: { type: "number", minimum: 0, maximum: 1 },
+        yNorm: { type: "number", minimum: 0, maximum: 1 },
+      },
       additionalProperties: false,
     },
   },
   {
     type: "function",
-    name: "ui_inspect",
-    description: "Inspect the frontmost macOS app name, window, and visible UI summary using Accessibility when available. Requires computer mode.",
+    name: "clipboard_read",
+    description: "Read the current macOS clipboard contents.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    type: "function",
+    name: "clipboard_write",
+    description: "Put text on the macOS clipboard so the user (or a paste) can use it.",
     parameters: {
       type: "object",
-      properties: {},
+      properties: { text: { type: "string" } },
+      required: ["text"],
       additionalProperties: false,
     },
   },
@@ -480,6 +539,357 @@ function keyCodeForKey(key) {
 
 function appleScriptString(value) {
   return JSON.stringify(String(value)).replace(/\\\\/g, "\\");
+}
+
+// ---------------------------------------------------------------------------
+// Native macOS bridge (Accessibility geometry + CGEvent input) and vision.
+// This is what makes computer use actually reliable instead of blind.
+// ---------------------------------------------------------------------------
+
+const repoRoot = path.join(__dirname, "..");
+const nativeDir = path.join(repoRoot, "native");
+const bridgeBin = path.join(nativeDir, "mac-bridge");
+let bridgeBuildPromise = null;
+let lastAxElements = []; // cache from the most recent inspect/loop step, for click-by-index/label
+
+async function ensureBridge() {
+  try {
+    await fs.access(bridgeBin);
+    return true;
+  } catch {
+    if (!bridgeBuildPromise) {
+      bridgeBuildPromise = execFileAsync("bash", [path.join(nativeDir, "build.sh")], { cwd: repoRoot }).catch(
+        (error) => {
+          bridgeBuildPromise = null;
+          throw error;
+        },
+      );
+    }
+    await bridgeBuildPromise;
+    return true;
+  }
+}
+
+async function bridge(...args) {
+  await ensureBridge();
+  const { stdout } = await execFileAsync(bridgeBin, args.map(String), { maxBuffer: 16 * 1024 * 1024 });
+  const parsed = JSON.parse(stdout.trim());
+  if (parsed.ok === false) throw new Error(parsed.error || "bridge error");
+  return parsed;
+}
+
+async function bridgePermissions() {
+  try {
+    return await bridge("permcheck");
+  } catch {
+    return { accessibility: false, screenRecording: false };
+  }
+}
+
+async function displayInfo() {
+  try {
+    return await bridge("displayinfo");
+  } catch {
+    return { width: 1440, height: 900, scale: 2 };
+  }
+}
+
+function sipsDimensions(stdout) {
+  const w = /pixelWidth:\s*(\d+)/.exec(stdout);
+  const h = /pixelHeight:\s*(\d+)/.exec(stdout);
+  return { width: w ? Number(w[1]) : 0, height: h ? Number(h[1]) : 0 };
+}
+
+const VISION_MAX_WIDTH = 1280;
+
+// Capture the screen, downscale for cheap vision. Click accuracy does NOT depend on
+// this size — clicks use AX element geometry or normalized coords mapped to logical points.
+async function captureScreen() {
+  await fs.mkdir(dataDir, { recursive: true });
+  const stamp = `${Date.now()}-${crypto.randomUUID().slice(0, 6)}`;
+  const rawPath = path.join(dataDir, `shot-${stamp}.png`);
+  await execFileAsync("screencapture", ["-x", "-t", "png", rawPath]);
+  const { stdout } = await execFileAsync("sips", ["-g", "pixelWidth", "-g", "pixelHeight", rawPath]);
+  const pixels = sipsDimensions(stdout);
+  const smallPath = path.join(dataDir, `shot-${stamp}-v.png`);
+  const targetW = Math.max(320, Math.min(VISION_MAX_WIDTH, pixels.width || VISION_MAX_WIDTH));
+  await execFileAsync("sips", ["-Z", String(targetW), rawPath, "--out", smallPath]);
+  const buffer = await fs.readFile(smallPath);
+  return { path: smallPath, dataUrl: `data:image/png;base64,${buffer.toString("base64")}` };
+}
+
+// Chat-completions vision call with model auto-discovery (the account's exact vision
+// model is unknown, so probe a candidate list once and cache the winner).
+// Order matters: the agent loop makes one vision call per step, so latency compounds.
+// gpt-4.1 is fast (~0.8s) and strong at UI grounding; gpt-5 is a slower heavy fallback.
+const PLANNER_CANDIDATES = [process.env.RICKY_VISION_MODEL, "gpt-4.1", "gpt-4o", "gpt-5", "gpt-4o-mini"].filter(Boolean);
+let plannerModel = null;
+
+async function callVision(messages, { json = false } = {}) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is missing in .env.local.");
+  const candidates = plannerModel ? [plannerModel] : PLANNER_CANDIDATES;
+  let lastError = "no vision model available";
+  for (const model of candidates) {
+    const body = { model, messages };
+    if (json) body.response_format = { type: "json_object" };
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (response.ok) {
+      plannerModel = model;
+      const data = await response.json();
+      return data.choices?.[0]?.message?.content || "";
+    }
+    lastError = `${response.status} ${await response.text()}`;
+    if (!/model|not\s*found|does not exist|unsupported|invalid/i.test(lastError)) break;
+  }
+  throw new Error(`Vision request failed: ${lastError}`);
+}
+
+// Push updates into the renderer while a long tool (computer_task) runs.
+function pushArtifact(artifact) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("ricky:push-artifact", artifact);
+}
+function pushTranscript(role, text) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("ricky:push-transcript", { role, text });
+}
+
+const DESTRUCTIVE = /\b(send|delete|remove|buy|purchase|pay|checkout|confirm|submit|discard|trash|unsubscribe|deactivate|sign\s*out|log\s*out|reset|erase|wipe|format)\b/i;
+
+function axSummary(elements) {
+  if (!elements.length) return "(no accessible elements — the app may not expose Accessibility, use vision coordinates)";
+  return elements
+    .map((el) => `#${el.i} ${el.role.replace(/^AX/, "")}${el.label ? ` "${el.label}"` : ""} @(${el.cx},${el.cy})`)
+    .join("\n");
+}
+
+function resolveTarget(args, logical) {
+  if (Number.isFinite(args.index) && lastAxElements[args.index]) {
+    const el = lastAxElements[args.index];
+    return { x: el.cx, y: el.cy, label: el.label, role: el.role };
+  }
+  if (typeof args.label === "string" && args.label.trim()) {
+    const needle = args.label.trim().toLowerCase();
+    const el =
+      lastAxElements.find((e) => e.label.toLowerCase() === needle) ||
+      lastAxElements.find((e) => e.label.toLowerCase().includes(needle));
+    if (el) return { x: el.cx, y: el.cy, label: el.label, role: el.role };
+  }
+  if (Number.isFinite(args.xNorm) && Number.isFinite(args.yNorm)) {
+    return { x: Math.round(args.xNorm * logical.width), y: Math.round(args.yNorm * logical.height), label: "", role: "" };
+  }
+  if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
+    return { x: Math.round(args.x), y: Math.round(args.y), label: "", role: "" };
+  }
+  return null;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const COMPUTER_PRIMITIVES = new Set([
+  "computer_open_app",
+  "computer_see",
+  "computer_inspect",
+  "computer_click",
+  "computer_type",
+  "computer_key",
+  "computer_scroll",
+  "computer_move",
+]);
+
+function setClipboard(text) {
+  return new Promise((resolve, reject) => {
+    const proc = execFile("pbcopy", (error) => (error ? reject(error) : resolve()));
+    proc.stdin.end(String(text));
+  });
+}
+
+async function getClipboard() {
+  const { stdout } = await execFileAsync("pbpaste", [], { maxBuffer: 8 * 1024 * 1024 });
+  return stdout;
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2: the computer-use agent loop. The voice model delegates a whole task
+// here; this runs an observe -> plan -> act -> verify cycle with a vision model,
+// grounded on Accessibility geometry, with host-enforced confirmation on
+// destructive clicks. Progress streams to the UI live.
+// ---------------------------------------------------------------------------
+
+const PLANNER_SYSTEM = `You are Ricky's computer-use planner. You drive a real macOS screen to accomplish a goal.
+Each step you receive a screenshot and a list of accessible UI elements, each with an index and center coordinates.
+Respond with STRICT JSON only, no prose:
+{"thought":"<one short line>","done":<bool>,"say":"<summary, only when done>","action":<action object or null>}
+Action shapes:
+- {"type":"click","index":N}                    click a listed element (PREFERRED — most reliable)
+- {"type":"click","xNorm":0.0,"yNorm":0.0,"button":"left","double":false}   fraction of screen when no element fits
+- {"type":"type","text":"...","paste":false,"submit":false}   submit=true presses Return afterward
+- {"type":"key","combo":"cmd+t"}                 modifiers cmd/opt/ctrl/shift plus a key
+- {"type":"scroll","direction":"up|down|left|right","amount":5}
+- {"type":"open_app","app":"Safari"}
+- {"type":"wait","ms":800}
+Rules: prefer clicking by index; take ONE action per step; after each action re-read the next screenshot before continuing.
+Set done=true with a short 'say' the moment the goal is satisfied. Never claim success you cannot see — verify visually.`;
+
+function taskArtifact(goal, history, result) {
+  return {
+    title: "Computer task",
+    kind: "markdown",
+    content: `# ${goal}\n\n${history.map((h) => `- ${h}`).join("\n") || "- (no steps)"}\n\n**Result:** ${result}`,
+  };
+}
+
+async function execAction(action, logical) {
+  const type = String(action.type || "");
+  if (type === "open_app") {
+    await execFileAsync("open", ["-a", String(action.app || action.appName || "")]);
+    await sleep(800);
+    return `opened ${action.app || action.appName || "app"}`;
+  }
+  if (type === "type") {
+    const text = String(action.text || "");
+    if (action.paste) {
+      await setClipboard(text);
+      await bridge("key", "cmd+v");
+    } else {
+      await bridge("type", text);
+    }
+    if (action.submit) await bridge("key", "return");
+    return `typed "${text.slice(0, 60)}"${action.submit ? " + return" : ""}`;
+  }
+  if (type === "key") {
+    const combo = String(action.combo || action.key || "");
+    await bridge("key", combo);
+    return `pressed ${combo}`;
+  }
+  if (type === "scroll") {
+    const amount = Math.max(1, Math.min(50, Number(action.amount || 5)));
+    const map = { up: [0, amount], down: [0, -amount], left: [amount, 0], right: [-amount, 0] };
+    const [dx, dy] = map[String(action.direction || "down")] || [0, -amount];
+    await bridge("scroll", dx, dy);
+    return `scrolled ${action.direction || "down"}`;
+  }
+  if (type === "click") {
+    const target = resolveTarget(action, logical);
+    if (!target) throw new Error("click target could not be resolved");
+    const count = action.double ? 2 : 1;
+    await bridge("click", target.x, target.y, count, action.button === "right" ? "right" : "left");
+    return `clicked ${target.label || `${target.x},${target.y}`}`;
+  }
+  if (type === "wait") {
+    await sleep(Math.min(4000, Number(action.ms || 800)));
+    return "waited";
+  }
+  throw new Error(`unknown action: ${type}`);
+}
+
+async function runComputerTask(goal, { maxSteps = 12, allowRisky = false } = {}) {
+  if (!goal.trim()) return { ok: false, error: "No goal was given for the task." };
+
+  // Enter computer mode so the mini face shows and the big window is out of the way.
+  currentMode = "computer";
+  setWindowMode("computer");
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("ricky:set-mode", "computer");
+
+  const logical = await displayInfo();
+  const perms = await bridgePermissions();
+  const history = [];
+  pushTranscript("tool", `Starting task: ${goal}`);
+  if (!perms.accessibility) {
+    pushTranscript("tool", "Accessibility is off — using vision coordinates. Grant it in System Settings for reliable clicks.");
+  }
+
+  for (let step = 1; step <= maxSteps; step += 1) {
+    let dump = { elements: [], app: "", window: "" };
+    try {
+      dump = await bridge("axdump", 160);
+    } catch {
+      /* AX may be unavailable; vision coordinates still work */
+    }
+    lastAxElements = Array.isArray(dump.elements) ? dump.elements : [];
+
+    const shot = await captureScreen();
+    pushArtifact({ title: `Task · step ${step}`, kind: "image", content: shot.dataUrl });
+
+    const messages = [
+      { role: "system", content: PLANNER_SYSTEM },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
+              `Goal: ${goal}\n` +
+              `Step ${step} of ${maxSteps}\n` +
+              `Front app: ${dump.app || "unknown"}${dump.window ? ` — ${dump.window}` : ""}\n\n` +
+              `Accessible elements (click by index when possible):\n${axSummary(lastAxElements)}\n\n` +
+              `Recent actions:\n${history.slice(-6).map((h) => `- ${h}`).join("\n") || "(none yet)"}\n\n` +
+              `Decide the single next action. Respond with JSON only.`,
+          },
+          { type: "image_url", image_url: { url: shot.dataUrl } },
+        ],
+      },
+    ];
+
+    let plan;
+    try {
+      plan = JSON.parse(await callVision(messages, { json: true }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      pushTranscript("tool", `Planner error: ${message}`);
+      return { ok: false, mode: "computer", error: `Planner error: ${message}` };
+    }
+
+    if (plan.thought) pushTranscript("tool", `Step ${step}: ${plan.thought}`);
+
+    if (plan.done === true) {
+      const summary = plan.say || "Task complete.";
+      pushTranscript("tool", `Done: ${summary}`);
+      return { ok: true, mode: "computer", steps: step, summary, artifact: taskArtifact(goal, history, summary) };
+    }
+
+    if (!plan.action || typeof plan.action !== "object") {
+      history.push("(no action returned)");
+      continue;
+    }
+
+    // Host-enforced safety: never let the planner self-approve a destructive click.
+    if (plan.action.type === "click" && !allowRisky) {
+      const target = resolveTarget(plan.action, logical);
+      if (target && DESTRUCTIVE.test(target.label)) {
+        pushTranscript("tool", `Paused — needs confirmation to click "${target.label}".`);
+        return {
+          ok: false,
+          requiresConfirmation: true,
+          mode: "computer",
+          message: `To continue "${goal}", Ricky needs to click "${target.label}", which looks destructive (send/delete/pay). Ask the user to confirm out loud; if they approve, call computer_task again with allowRisky true.`,
+          artifact: { title: "Confirm action", kind: "progress", content: `Pending: click "${target.label}"` },
+        };
+      }
+    }
+
+    try {
+      const result = await execAction(plan.action, logical);
+      history.push(result);
+      pushTranscript("tool", result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      history.push(`error: ${message}`);
+      pushTranscript("tool", `Action error: ${message}`);
+    }
+    await sleep(550);
+  }
+
+  return {
+    ok: true,
+    mode: "computer",
+    steps: maxSteps,
+    summary: `Stopped at the ${maxSteps}-step limit before finishing.`,
+    artifact: taskArtifact(goal, history, `Stopped at the ${maxSteps}-step limit.`),
+  };
 }
 
 async function createWindow() {
@@ -764,87 +1174,129 @@ ipcMain.handle("tools:execute", async (_event, toolCall) => {
       return { ok: true, deleted: before !== db.records.length, artifact: recordsArtifact(db.records, "All Records") };
     }
 
-    if (name.startsWith("computer_") || name === "screen_snapshot" || name === "ui_inspect") {
+    if (name === "clipboard_read") {
+      const text = await getClipboard();
+      return { ok: true, text, artifact: { title: "Clipboard", kind: "text", content: text.slice(0, 4000) || "(clipboard is empty)" } };
+    }
+
+    if (name === "clipboard_write") {
+      await setClipboard(String(args.text || ""));
+      return { ok: true, message: "Copied to the clipboard." };
+    }
+
+    if (name === "computer_task") {
+      return await runComputerTask(String(args.goal || ""), {
+        maxSteps: Math.max(1, Math.min(30, Number(args.maxSteps || 12))),
+        allowRisky: args.allowRisky === true,
+      });
+    }
+
+    // Direct primitives require computer mode. computer_task enters it on its own.
+    if (COMPUTER_PRIMITIVES.has(name)) {
       const blocked = requireComputerMode();
       if (blocked) return blocked;
     }
 
     if (name === "computer_open_app") {
       await execFileAsync("open", ["-a", String(args.appName || "")]);
+      await sleep(700);
       return { ok: true, message: `Opened ${args.appName}.` };
     }
 
-    if (name === "computer_type_text") {
-      await execFileAsync("osascript", ["-e", `tell application "System Events" to keystroke ${appleScriptString(args.text || "")}`]);
-      return { ok: true, message: "Typed text into the active app." };
+    if (name === "computer_see") {
+      const shot = await captureScreen();
+      pushArtifact({ title: "Screen", kind: "image", content: shot.dataUrl });
+      const question = String(args.question || "").trim();
+      const description = await callVision([
+        {
+          role: "system",
+          content:
+            "You are Ricky's eyes on the user's macOS screen. Describe what is visible concisely and, if asked, answer the question. Name the frontmost app, key windows, buttons, fields, and any obvious state. Max 4 sentences.",
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: question ? `Look at my screen. ${question}` : "What is on my screen right now?" },
+            { type: "image_url", image_url: { url: shot.dataUrl } },
+          ],
+        },
+      ]);
+      return { ok: true, description, artifact: { title: "Screen", kind: "image", content: shot.dataUrl } };
     }
 
-    if (name === "computer_press_key") {
-      const keyCode = keyCodeForKey(args.key);
-      if (!keyCode) {
-        return { ok: false, error: `Unsupported key: ${args.key}` };
-      }
-      const repeat = Math.max(1, Math.min(20, Number(args.repeat || 1)));
-      await execFileAsync("osascript", ["-e", `tell application "System Events" to repeat ${repeat} times\nkey code ${keyCode}\nend repeat`]);
-      return { ok: true, message: `Pressed ${args.key}.` };
+    if (name === "computer_inspect") {
+      const dump = await bridge("axdump", 200);
+      lastAxElements = Array.isArray(dump.elements) ? dump.elements : [];
+      const summary = axSummary(lastAxElements);
+      return {
+        ok: true,
+        app: dump.app,
+        window: dump.window,
+        count: lastAxElements.length,
+        elements: summary,
+        artifact: {
+          title: `UI: ${dump.app || "frontmost app"}`,
+          kind: "text",
+          content: `${dump.app || "?"}${dump.window ? ` — ${dump.window}` : ""}\n\n${summary}`,
+        },
+      };
     }
 
     if (name === "computer_click") {
-      if (requiresConfirmation(args)) {
-        return { ok: false, requiresConfirmation: true, message: "Confirmation required before clicking a risky target." };
+      const logical = await displayInfo();
+      const target = resolveTarget(args, logical);
+      if (!target) {
+        return { ok: false, error: "No click target. Give index (from computer_inspect), label, x/y, or xNorm/yNorm." };
       }
-      await execFileAsync("osascript", ["-e", `tell application "System Events" to click at {${Number(args.x)}, ${Number(args.y)}}`]);
-      return { ok: true, message: `Clicked ${args.x}, ${args.y}.` };
+      const risky =
+        args.confirmed !== true &&
+        (DESTRUCTIVE.test(target.label) || args.risk === "may_send_or_modify" || args.risk === "private_or_sensitive");
+      if (risky) {
+        return {
+          ok: false,
+          requiresConfirmation: true,
+          message: `About to click ${target.label ? `"${target.label}"` : `(${target.x}, ${target.y})`}, which may be destructive. Confirm first.`,
+        };
+      }
+      const count = args.double === true ? 2 : Math.max(1, Number(args.count || 1));
+      await bridge("click", target.x, target.y, count, args.button === "right" ? "right" : "left");
+      return { ok: true, message: `Clicked ${target.label ? `"${target.label}"` : `${target.x}, ${target.y}`}.` };
+    }
+
+    if (name === "computer_type") {
+      const text = String(args.text || "");
+      if (args.paste === true) {
+        await setClipboard(text);
+        await bridge("key", "cmd+v");
+      } else {
+        await bridge("type", text);
+      }
+      if (args.submit === true) await bridge("key", "return");
+      return { ok: true, message: `Typed ${text.length} characters${args.submit === true ? " and pressed Return" : ""}.` };
+    }
+
+    if (name === "computer_key") {
+      const combo = String(args.combo || args.key || "").trim();
+      if (!combo) return { ok: false, error: "No key combo given." };
+      const repeat = Math.max(1, Math.min(20, Number(args.repeat || 1)));
+      for (let i = 0; i < repeat; i += 1) await bridge("key", combo);
+      return { ok: true, message: `Pressed ${combo}${repeat > 1 ? ` ×${repeat}` : ""}.` };
     }
 
     if (name === "computer_scroll") {
-      const direction = String(args.direction || "down");
-      const amount = Math.max(1, Math.min(20, Number(args.amount || 4)));
-      const keyByDirection = { up: 126, down: 125, left: 123, right: 124 };
-      const keyCode = keyByDirection[direction] || 125;
-      await execFileAsync("osascript", ["-e", `tell application "System Events" to repeat ${amount} times\nkey code ${keyCode}\nend repeat`]);
-      return { ok: true, message: `Scrolled ${direction}.` };
+      const amount = Math.max(1, Math.min(50, Number(args.amount || 5)));
+      const map = { up: [0, amount], down: [0, -amount], left: [amount, 0], right: [-amount, 0] };
+      const [dx, dy] = map[String(args.direction || "down")] || [0, -amount];
+      await bridge("scroll", dx, dy);
+      return { ok: true, message: `Scrolled ${args.direction || "down"}.` };
     }
 
-    if (name === "screen_snapshot") {
-      await fs.mkdir(dataDir, { recursive: true });
-      const screenshotPath = path.join(dataDir, `screenshot-${Date.now()}.png`);
-      await execFileAsync("screencapture", ["-x", screenshotPath]);
-      return {
-        ok: true,
-        path: screenshotPath,
-        artifact: {
-          title: "Screen Snapshot",
-          kind: "image",
-          content: screenshotPath,
-        },
-      };
-    }
-
-    if (name === "ui_inspect") {
-      const script = `tell application "System Events"
-set frontApp to first application process whose frontmost is true
-set appName to name of frontApp
-set windowName to ""
-try
-  set windowName to name of front window of frontApp
-end try
-set roleSummary to ""
-try
-  set roleSummary to value of attribute "AXRoleDescription" of front window of frontApp
-end try
-return "App: " & appName & linefeed & "Window: " & windowName & linefeed & "Role: " & roleSummary
-end tell`;
-      const { stdout } = await execFileAsync("osascript", ["-e", script]);
-      return {
-        ok: true,
-        summary: stdout.trim(),
-        artifact: {
-          title: "UI Inspect",
-          kind: "text",
-          content: stdout.trim(),
-        },
-      };
+    if (name === "computer_move") {
+      const logical = await displayInfo();
+      const target = resolveTarget(args, logical);
+      if (!target) return { ok: false, error: "No move target." };
+      await bridge("move", target.x, target.y);
+      return { ok: true, message: `Moved cursor to ${target.x}, ${target.y}.` };
     }
 
     return { ok: false, error: `Unknown tool: ${name}` };
@@ -965,19 +1417,21 @@ Here is what you can ask me to do.
 - Add notes to Ricky's local note grid.
 - Create, search, update, and confirm-delete local database records.
 
-## Computer Use Mode
+## Computer Use
 
-- "Switch to computer use mode."
-- Open apps, click, type, press Enter/Return, scroll, inspect the UI, and take screen snapshots.
-- Ricky asks before risky actions like sending, deleting, buying, changing settings, or sharing private info.
+- "Open Safari and search for the latest AI video tools." — Ricky drives the screen itself, step by step.
+- "What's on my screen right now?" — Ricky looks and tells you.
+- "Reply to the top email and say I'll be there at noon."
+- Behind the scenes: Ricky sees the screen, reads the actual on-screen elements, then clicks, types, uses shortcuts, and scrolls with a real cursor — verifying each step.
+- Ricky pauses for your OK before anything destructive: sending, deleting, buying, or changing settings.
 
 ## Good Starter Prompts
 
 - "Show me the menu."
 - "Search the web for the latest AI video tools."
 - "Create a chart of my workflow."
-- "Add a note: follow up on the sponsor."
-- "Switch to computer use mode and open Notes."`;
+- "Open Notes and start a new note titled Ideas."
+- "Look at my screen and tell me what that error says."`;
 }
 
 async function generateImage(args) {

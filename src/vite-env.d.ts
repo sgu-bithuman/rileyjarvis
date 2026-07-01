@@ -45,6 +45,9 @@ declare global {
       createRealtimeToken: () => Promise<{ value: string; expiresAt: number | null }>;
       executeTool: (toolCall: RickyToolCall) => Promise<RickyToolResult>;
       getToolSpecs: () => Promise<RickyToolSpec[]>;
+      onPushArtifact: (callback: (artifact: RickyArtifact) => void) => () => void;
+      onPushTranscript: (callback: (entry: { role: "user" | "ricky" | "system" | "tool"; text: string }) => void) => () => void;
+      onSetMode: (callback: (mode: "display" | "computer") => void) => () => void;
     };
   }
 }
