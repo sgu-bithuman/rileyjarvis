@@ -117,19 +117,30 @@ func dragMouse(_ x1: Double, _ y1: Double, _ x2: Double, _ y2: Double) {
     let a = CGPoint(x: x1, y: y1)
     let b = CGPoint(x: x2, y: y2)
     moveMouse(a)
-    post(CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: a, mouseButton: .left))
+    let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: a, mouseButton: .left)
+    down?.setIntegerValueField(.mouseEventClickState, value: 1)
+    post(down)
     let steps = 12
     for i in 1...steps {
         let t = Double(i) / Double(steps)
         let p = CGPoint(x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t)
-        post(CGEvent(mouseEventSource: src, mouseType: .leftMouseDragged, mouseCursorPosition: p, mouseButton: .left))
+        let drag = CGEvent(mouseEventSource: src, mouseType: .leftMouseDragged, mouseCursorPosition: p, mouseButton: .left)
+        drag?.setIntegerValueField(.mouseEventClickState, value: 1)
+        post(drag)
     }
-    post(CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: b, mouseButton: .left))
+    let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: b, mouseButton: .left)
+    up?.setIntegerValueField(.mouseEventClickState, value: 1)
+    post(up)
 }
 
-func scrollWheel(_ dx: Int, _ dy: Int) {
+func clampI32(_ v: Double) -> Int32 {
+    if !v.isFinite { return 0 }
+    return Int32(max(-2_000_000_000, min(2_000_000_000, v)))
+}
+
+func scrollWheel(_ dx: Double, _ dy: Double) {
     post(CGEvent(scrollWheelEvent2Source: src, units: .line, wheelCount: 2,
-                 wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0))
+                 wheel1: clampI32(dy), wheel2: clampI32(dx), wheel3: 0))
 }
 
 let KEYCODES: [String: CGKeyCode] = [
@@ -151,6 +162,7 @@ let KEYCODES: [String: CGKeyCode] = [
 func pressCombo(_ combo: String) {
     var flags: CGEventFlags = []
     var keyName = ""
+    var keyCount = 0
     for raw in combo.lowercased().split(separator: "+") {
         let tok = String(raw)
         switch tok {
@@ -159,9 +171,13 @@ func pressCombo(_ combo: String) {
         case "opt", "option", "alt": flags.insert(.maskAlternate)
         case "ctrl", "control": flags.insert(.maskControl)
         case "fn", "function": flags.insert(.maskSecondaryFn)
-        default: keyName = tok
+        default:
+            keyName = tok
+            keyCount += 1
         }
     }
+    // Keycodes are US-ANSI physical positions (no layout translation); documented limitation.
+    if keyCount != 1 { fail("combo must have exactly one non-modifier key: \(combo)") }
     guard let code = KEYCODES[keyName] else { fail("unknown key: \(keyName)") }
     let d = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true)
     d?.flags = flags
@@ -230,17 +246,24 @@ func cmdFrontApp() {
     ])
 }
 
+struct Candidate {
+    let role: String
+    let label: String
+    let rect: CGRect
+    let actionable: Bool
+}
+
 func cmdAxDump(_ maxEl: Int) {
     let (app, appEl) = frontApp()
     guard let appEl = appEl else { fail("no frontmost application") }
     let win = rootWindow(appEl)
     let windowTitle = axString(win, kAXTitleAttribute as String) ?? ""
 
-    var elements: [[String: Any]] = []
-    var index = 0
+    var candidates: [Candidate] = []
+    let hardCap = 800
 
     func walk(_ el: AXUIElement, _ depth: Int) {
-        if elements.count >= maxEl || depth > 16 { return }
+        if candidates.count >= hardCap || depth > 25 { return }
         let role = axString(el, kAXRoleAttribute as String) ?? ""
         let label = axString(el, kAXTitleAttribute as String)
             ?? axString(el, kAXDescriptionAttribute as String)
@@ -249,28 +272,42 @@ func cmdAxDump(_ maxEl: Int) {
             ?? ""
         let actionable = ACTIONABLE.contains(role)
         if let f = axFrame(el), f.width >= 2, f.height >= 2, (actionable || !label.isEmpty) {
-            elements.append([
-                "i": index,
-                "role": role,
-                "label": String(label.prefix(120)),
-                "x": Int(f.minX), "y": Int(f.minY),
-                "w": Int(f.width), "h": Int(f.height),
-                "cx": Int(f.midX), "cy": Int(f.midY),
-                "actionable": actionable,
-            ])
-            index += 1
+            candidates.append(Candidate(role: role, label: String(label.prefix(120)), rect: f, actionable: actionable))
         }
         for c in axChildren(el) {
             walk(c, depth + 1)
-            if elements.count >= maxEl { return }
+            if candidates.count >= hardCap { return }
         }
     }
     walk(win, 0)
+
+    // Actionable-first (stable), so a small budget is never eaten by static text
+    // before the buttons/links the caller actually needs to click.
+    let ordered = candidates.enumerated().sorted { a, b in
+        if a.element.actionable != b.element.actionable { return a.element.actionable }
+        return a.offset < b.offset
+    }.map { $0.element }
+    let truncated = ordered.count > maxEl
+    let kept = ordered.prefix(maxEl)
+
+    var elements: [[String: Any]] = []
+    for (i, e) in kept.enumerated() {
+        elements.append([
+            "i": i,
+            "role": e.role,
+            "label": e.label,
+            "x": Int(e.rect.minX), "y": Int(e.rect.minY),
+            "w": Int(e.rect.width), "h": Int(e.rect.height),
+            "cx": Int(e.rect.midX), "cy": Int(e.rect.midY),
+            "actionable": e.actionable,
+        ])
+    }
 
     emit([
         "app": app?.localizedName ?? "",
         "window": windowTitle,
         "count": elements.count,
+        "truncated": truncated,
         "elements": elements,
     ])
 }
@@ -281,8 +318,21 @@ let args = Array(CommandLine.arguments.dropFirst())
 guard let cmd = args.first else { fail("no command") }
 
 func num(_ i: Int, _ dflt: Double = 0) -> Double {
-    guard i < args.count, let v = Double(args[i]) else { return dflt }
+    guard i < args.count, let v = Double(args[i]), v.isFinite else { return dflt }
     return v
+}
+
+func hasNum(_ i: Int) -> Bool {
+    guard i < args.count, let v = Double(args[i]), v.isFinite else { return false }
+    return true
+}
+
+// Fail loudly (not silently no-op) when Accessibility is off, so callers can tell
+// "permission denied" apart from "nothing happened" / "empty window".
+let NEEDS_AX: Set<String> = ["axdump", "click", "move", "drag", "scroll", "key", "type"]
+if NEEDS_AX.contains(cmd) && !AXIsProcessTrusted() {
+    emit(["ok": false, "error": "accessibility_denied"])
+    exit(1)
 }
 
 switch cmd {
@@ -293,8 +343,9 @@ case "displayinfo":
 case "frontapp":
     cmdFrontApp()
 case "axdump":
-    cmdAxDump(Int(num(1, 200)))
+    cmdAxDump(Int(max(1, min(1000, num(1, 200)))))
 case "click":
+    guard hasNum(1) && hasNum(2) else { fail("click needs numeric x and y") }
     var clickCount = 1
     var clickButton = "left"
     for a in args.dropFirst(3) {
@@ -303,13 +354,15 @@ case "click":
     clickMouse(num(1), num(2), button: clickButton, count: clickCount)
     emit(["message": "clicked"])
 case "move":
+    guard hasNum(1) && hasNum(2) else { fail("move needs numeric x and y") }
     moveMouse(CGPoint(x: num(1), y: num(2)))
     emit(["message": "moved"])
 case "drag":
+    guard hasNum(1) && hasNum(2) && hasNum(3) && hasNum(4) else { fail("drag needs x1 y1 x2 y2") }
     dragMouse(num(1), num(2), num(3), num(4))
     emit(["message": "dragged"])
 case "scroll":
-    scrollWheel(Int(num(1)), Int(num(2)))
+    scrollWheel(num(1), num(2))
     emit(["message": "scrolled"])
 case "key":
     guard args.count > 1 else { fail("key needs a combo") }

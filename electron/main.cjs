@@ -31,7 +31,7 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 - For a quick one-off, use the primitives directly: computer_see (look at the screen), computer_inspect (list clickable elements), then computer_click (by index or label — never guess raw pixels if an element exists), computer_type, computer_key, computer_scroll.
 - To answer "what's on my screen" or "what does this say", use computer_see.
 - clipboard_read / clipboard_write are handy for moving text between apps without retyping.
-- If computer_task returns requiresConfirmation, tell the user exactly what it wants to do, ask them out loud, and only if they approve call computer_task again with allowRisky true.
+- If computer_task returns requiresConfirmation, tell the user exactly what it named (the pendingTarget), ask them out loud, and only if they approve call computer_task again with the same goal and confirmTarget set to that exact string. This approves only that one control.
 
 # Tool Behavior
 - Use read-only tools when the user's intent is clear.
@@ -278,13 +278,16 @@ const toolSpecs = [
     type: "function",
     name: "computer_task",
     description:
-      "Autonomously accomplish a multi-step task on the user's screen (e.g. 'open Safari and search for X', 'reply to the top email', 'find the cheapest flight'). Ricky observes the screen, plans, and acts step by step, verifying visually. Use this for anything beyond a single click or keystroke. Enters computer use mode automatically. If it returns requiresConfirmation, ask the user out loud, then call again with allowRisky true.",
+      "Autonomously accomplish a multi-step task on the user's screen (e.g. 'open Safari and search for X', 'reply to the top email', 'find the cheapest flight'). Ricky observes the screen, plans, and acts step by step, verifying visually. Use this for anything beyond a single click or keystroke. Enters computer use mode automatically. If it returns requiresConfirmation, tell the user what it named and ask out loud; if they approve, call again with the same goal and confirmTarget set to exactly the pendingTarget string it returned.",
     parameters: {
       type: "object",
       properties: {
         goal: { type: "string", description: "The task to accomplish, in plain language." },
         maxSteps: { type: "number", minimum: 1, maximum: 30 },
-        allowRisky: { type: "boolean", description: "Set true only after the user has explicitly confirmed a risky/destructive step." },
+        confirmTarget: {
+          type: "string",
+          description: "Only after the user approves a specific destructive step: the exact pendingTarget string from the prior requiresConfirmation result. Approves just that one control, nothing else.",
+        },
       },
       required: ["goal"],
       additionalProperties: false,
@@ -551,6 +554,7 @@ const nativeDir = path.join(repoRoot, "native");
 const bridgeBin = path.join(nativeDir, "mac-bridge");
 let bridgeBuildPromise = null;
 let lastAxElements = []; // cache from the most recent inspect/loop step, for click-by-index/label
+let taskCancelRequested = false; // set when the user switches back to display mid-task
 
 async function ensureBridge() {
   try {
@@ -609,6 +613,13 @@ async function captureScreen() {
   const stamp = `${Date.now()}-${crypto.randomUUID().slice(0, 6)}`;
   const rawPath = path.join(dataDir, `shot-${stamp}.png`);
   await execFileAsync("screencapture", ["-x", "-t", "png", rawPath]);
+  // screencapture can exit 0 while writing nothing when Screen Recording is denied.
+  const rawStat = await fs.stat(rawPath).catch(() => null);
+  if (!rawStat || rawStat.size === 0) {
+    throw new Error(
+      "Could not capture the screen. Enable Screen Recording for this app in System Settings → Privacy & Security → Screen Recording, then try again.",
+    );
+  }
   const { stdout } = await execFileAsync("sips", ["-g", "pixelWidth", "-g", "pixelHeight", rawPath]);
   const pixels = sipsDimensions(stdout);
   const smallPath = path.join(dataDir, `shot-${stamp}-v.png`);
@@ -628,7 +639,11 @@ let plannerModel = null;
 async function callVision(messages, { json = false } = {}) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("OPENAI_API_KEY is missing in .env.local.");
-  const candidates = plannerModel ? [plannerModel] : PLANNER_CANDIDATES;
+  // Prefer the cached winner, but still fall through to the others if it fails for
+  // this particular call (e.g. a model that works for describe but rejects json mode).
+  const candidates = plannerModel
+    ? [plannerModel, ...PLANNER_CANDIDATES.filter((m) => m !== plannerModel)]
+    : PLANNER_CANDIDATES;
   let lastError = "no vision model available";
   for (const model of candidates) {
     const body = { model, messages };
@@ -685,6 +700,50 @@ function resolveTarget(args, logical) {
     return { x: Math.round(args.x), y: Math.round(args.y), label: "", role: "" };
   }
   return null;
+}
+
+// Borrow the label of whatever AX element sits under a point, so a click given by
+// raw/normalized coordinates still gets the same destructive-label safety check as
+// a click given by index/label. This closes the "click the Send button by pixels" bypass.
+function nearestLabel(x, y) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return "";
+  let best = "";
+  let bestDist = Infinity;
+  for (const el of lastAxElements) {
+    if (!el.label) continue;
+    const inside = x >= el.x && x <= el.x + el.w && y >= el.y && y <= el.y + el.h;
+    if (inside) return el.label;
+    const dist = Math.hypot((el.cx ?? el.x) - x, (el.cy ?? el.y) - y);
+    if (dist < 24 && dist < bestDist) {
+      bestDist = dist;
+      best = el.label;
+    }
+  }
+  return best;
+}
+
+const normalizeLabel = (s) =>
+  String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+// Returns a human description if the action is potentially destructive, else null.
+function actionDestructiveLabel(action, target) {
+  if (action.type === "click") {
+    const label = (target && target.label) || nearestLabel(target && target.x, target && target.y);
+    return DESTRUCTIVE.test(label) ? label || "this control" : null;
+  }
+  if (action.type === "key") {
+    const combo = String(action.combo || "").toLowerCase().replace(/\s+/g, "");
+    if (/cmd\+(shift\+)?(delete|backspace)/.test(combo)) return `shortcut ${action.combo}`;
+    return null;
+  }
+  return null;
+}
+
+function confirmMatches(destructiveLabel, confirmTarget) {
+  const a = normalizeLabel(destructiveLabel);
+  const b = normalizeLabel(confirmTarget);
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -786,23 +845,41 @@ async function execAction(action, logical) {
   throw new Error(`unknown action: ${type}`);
 }
 
-async function runComputerTask(goal, { maxSteps = 12, allowRisky = false } = {}) {
+async function runComputerTask(goal, { maxSteps = 12, confirmTarget = "" } = {}) {
   if (!goal.trim()) return { ok: false, error: "No goal was given for the task." };
 
+  // Nothing works without both permissions (CGEvent clicks and AX reads need
+  // Accessibility; screenshots need Screen Recording). Fail clearly up front rather
+  // than silently no-op'ing every step, and don't shrink the window if we can't act.
+  const perms = await bridgePermissions();
+  const missing = [
+    !perms.accessibility && "Accessibility",
+    !perms.screenRecording && "Screen Recording",
+  ].filter(Boolean);
+  if (missing.length) {
+    const list = missing.join(" and ");
+    return {
+      ok: false,
+      requiresPermission: true,
+      error: `I need ${list} permission to control the screen. Enable it in System Settings → Privacy & Security → ${missing.join(" and → ")}, then ask me again.`,
+    };
+  }
+
   // Enter computer mode so the mini face shows and the big window is out of the way.
+  taskCancelRequested = false;
   currentMode = "computer";
   setWindowMode("computer");
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("ricky:set-mode", "computer");
 
   const logical = await displayInfo();
-  const perms = await bridgePermissions();
   const history = [];
   pushTranscript("tool", `Starting task: ${goal}`);
-  if (!perms.accessibility) {
-    pushTranscript("tool", "Accessibility is off — using vision coordinates. Grant it in System Settings for reliable clicks.");
-  }
 
   for (let step = 1; step <= maxSteps; step += 1) {
+    if (taskCancelRequested) {
+      pushTranscript("tool", "Stopped by user.");
+      return { ok: true, steps: step - 1, summary: "Stopped by the user.", artifact: taskArtifact(goal, history, "Stopped by the user.") };
+    }
     let dump = { elements: [], app: "", window: "" };
     try {
       dump = await bridge("axdump", 160);
@@ -825,7 +902,7 @@ async function runComputerTask(goal, { maxSteps = 12, allowRisky = false } = {})
               `Goal: ${goal}\n` +
               `Step ${step} of ${maxSteps}\n` +
               `Front app: ${dump.app || "unknown"}${dump.window ? ` — ${dump.window}` : ""}\n\n` +
-              `Accessible elements (click by index when possible):\n${axSummary(lastAxElements)}\n\n` +
+              `Accessible elements (click by index when possible):\n${axSummary(lastAxElements)}${dump.truncated ? "\n(list truncated — scroll for more)" : ""}\n\n` +
               `Recent actions:\n${history.slice(-6).map((h) => `- ${h}`).join("\n") || "(none yet)"}\n\n` +
               `Decide the single next action. Respond with JSON only.`,
           },
@@ -840,7 +917,7 @@ async function runComputerTask(goal, { maxSteps = 12, allowRisky = false } = {})
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       pushTranscript("tool", `Planner error: ${message}`);
-      return { ok: false, mode: "computer", error: `Planner error: ${message}` };
+      return { ok: false, error: `Planner error: ${message}` };
     }
 
     if (plan.thought) pushTranscript("tool", `Step ${step}: ${plan.thought}`);
@@ -848,7 +925,7 @@ async function runComputerTask(goal, { maxSteps = 12, allowRisky = false } = {})
     if (plan.done === true) {
       const summary = plan.say || "Task complete.";
       pushTranscript("tool", `Done: ${summary}`);
-      return { ok: true, mode: "computer", steps: step, summary, artifact: taskArtifact(goal, history, summary) };
+      return { ok: true, steps: step, summary, artifact: taskArtifact(goal, history, summary) };
     }
 
     if (!plan.action || typeof plan.action !== "object") {
@@ -856,19 +933,20 @@ async function runComputerTask(goal, { maxSteps = 12, allowRisky = false } = {})
       continue;
     }
 
-    // Host-enforced safety: never let the planner self-approve a destructive click.
-    if (plan.action.type === "click" && !allowRisky) {
-      const target = resolveTarget(plan.action, logical);
-      if (target && DESTRUCTIVE.test(target.label)) {
-        pushTranscript("tool", `Paused — needs confirmation to click "${target.label}".`);
-        return {
-          ok: false,
-          requiresConfirmation: true,
-          mode: "computer",
-          message: `To continue "${goal}", Ricky needs to click "${target.label}", which looks destructive (send/delete/pay). Ask the user to confirm out loud; if they approve, call computer_task again with allowRisky true.`,
-          artifact: { title: "Confirm action", kind: "progress", content: `Pending: click "${target.label}"` },
-        };
-      }
+    // Host-enforced safety: a destructive click/shortcut (send/delete/pay/trash) pauses
+    // for confirmation unless THIS specific target was already approved. Coordinate and
+    // index clicks borrow the underlying element's label, so pixels can't dodge the gate.
+    const target = plan.action.type === "click" ? resolveTarget(plan.action, logical) : null;
+    const destructive = actionDestructiveLabel(plan.action, target);
+    if (destructive && !confirmMatches(destructive, confirmTarget)) {
+      pushTranscript("tool", `Paused — needs confirmation to ${plan.action.type === "click" ? "click" : "use"} "${destructive}".`);
+      return {
+        ok: false,
+        requiresConfirmation: true,
+        pendingTarget: destructive,
+        message: `To continue "${goal}", Ricky needs to ${plan.action.type === "click" ? "click" : "use"} "${destructive}", which looks destructive (send/delete/pay/trash). Ask the user to confirm out loud; if they approve, call computer_task again with the same goal and confirmTarget set to exactly "${destructive}".`,
+        artifact: { title: "Confirm action", kind: "progress", content: `Pending: ${destructive}` },
+      };
     }
 
     try {
@@ -885,7 +963,6 @@ async function runComputerTask(goal, { maxSteps = 12, allowRisky = false } = {})
 
   return {
     ok: true,
-    mode: "computer",
     steps: maxSteps,
     summary: `Stopped at the ${maxSteps}-step limit before finishing.`,
     artifact: taskArtifact(goal, history, `Stopped at the ${maxSteps}-step limit.`),
@@ -1029,6 +1106,8 @@ ipcMain.handle("tools:execute", async (_event, toolCall) => {
   try {
     if (name === "set_mode") {
       currentMode = args.mode === "computer" ? "computer" : "display";
+      // Switching back to display is also the user's "stop" for an in-flight task.
+      if (currentMode === "display") taskCancelRequested = true;
       setWindowMode(currentMode);
       return {
         ok: true,
@@ -1187,7 +1266,7 @@ ipcMain.handle("tools:execute", async (_event, toolCall) => {
     if (name === "computer_task") {
       return await runComputerTask(String(args.goal || ""), {
         maxSteps: Math.max(1, Math.min(30, Number(args.maxSteps || 12))),
-        allowRisky: args.allowRisky === true,
+        confirmTarget: String(args.confirmTarget || ""),
       });
     }
 
@@ -1227,12 +1306,15 @@ ipcMain.handle("tools:execute", async (_event, toolCall) => {
     if (name === "computer_inspect") {
       const dump = await bridge("axdump", 200);
       lastAxElements = Array.isArray(dump.elements) ? dump.elements : [];
-      const summary = axSummary(lastAxElements);
+      const summary =
+        axSummary(lastAxElements) +
+        (dump.truncated ? "\n(list truncated — more elements exist; scroll or ask again after narrowing)" : "");
       return {
         ok: true,
         app: dump.app,
         window: dump.window,
         count: lastAxElements.length,
+        truncated: dump.truncated === true,
         elements: summary,
         artifact: {
           title: `UI: ${dump.app || "frontmost app"}`,
@@ -1248,19 +1330,20 @@ ipcMain.handle("tools:execute", async (_event, toolCall) => {
       if (!target) {
         return { ok: false, error: "No click target. Give index (from computer_inspect), label, x/y, or xNorm/yNorm." };
       }
+      const effectiveLabel = target.label || nearestLabel(target.x, target.y);
       const risky =
         args.confirmed !== true &&
-        (DESTRUCTIVE.test(target.label) || args.risk === "may_send_or_modify" || args.risk === "private_or_sensitive");
+        (DESTRUCTIVE.test(effectiveLabel) || args.risk === "may_send_or_modify" || args.risk === "private_or_sensitive");
       if (risky) {
         return {
           ok: false,
           requiresConfirmation: true,
-          message: `About to click ${target.label ? `"${target.label}"` : `(${target.x}, ${target.y})`}, which may be destructive. Confirm first.`,
+          message: `About to click ${effectiveLabel ? `"${effectiveLabel}"` : `(${target.x}, ${target.y})`}, which may be destructive. Confirm first.`,
         };
       }
-      const count = args.double === true ? 2 : Math.max(1, Number(args.count || 1));
+      const count = args.double === true ? 2 : 1;
       await bridge("click", target.x, target.y, count, args.button === "right" ? "right" : "left");
-      return { ok: true, message: `Clicked ${target.label ? `"${target.label}"` : `${target.x}, ${target.y}`}.` };
+      return { ok: true, message: `Clicked ${effectiveLabel ? `"${effectiveLabel}"` : `${target.x}, ${target.y}`}.` };
     }
 
     if (name === "computer_type") {
